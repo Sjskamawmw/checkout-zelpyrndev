@@ -15,6 +15,14 @@ const INFINITEPAY_HANDLE = (process.env.INFINITEPAY_HANDLE || '').trim();
 const INFINITEPAY_REDIRECT_URL = (process.env.INFINITEPAY_REDIRECT_URL || '').trim();
 const INFINITEPAY_WEBHOOK_URL = (process.env.INFINITEPAY_WEBHOOK_URL || '').trim();
 const ORDER_HMAC_SECRET = (process.env.ORDER_HMAC_SECRET || '').trim();
+const EMAILJS_SERVICE_ID = (process.env.EMAILJS_SERVICE_ID || 'service_37zjx24').trim();
+const EMAILJS_TEMPLATE_ID = (process.env.EMAILJS_TEMPLATE_ID || 'template_vxh3c9g').trim();
+const EMAILJS_PUBLIC_KEY = (process.env.EMAILJS_PUBLIC_KEY || 'x5hcmELDSLfjTS8I0').trim();
+const PASSWORD_RESET_CODE_TTL_MS = 10 * 60 * 1000;
+const PASSWORD_RESET_RESEND_COOLDOWN_MS = 60 * 1000;
+const PASSWORD_RESET_SESSION_TTL_MS = 15 * 60 * 1000;
+const PASSWORD_RESET_MAX_FAILED_ATTEMPTS = 5;
+const PASSWORD_RESET_MAX_SENDS_PER_HOUR = 5;
 
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
   .split(',')
@@ -602,87 +610,8 @@ app.get('/api/admin/stats', requireAuth, async (req, res) => {
     if (!isAdminEmail(email)) {
       return res.status(403).json({ success: false, error: 'Apenas administradores podem acessar estatisticas.' });
     }
-
-    const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const monthStartISO = monthStart.toISOString();
-    const ordersSnapshot = await db.collection('orders').get();
-    const rankingMap = new Map();
-
-    ADMIN_EMAILS.forEach(adminEmail => {
-      const normalizedAdminEmail = normalizeEmail(adminEmail);
-      rankingMap.set(normalizedAdminEmail, {
-        adminId: '',
-        adminEmail: normalizedAdminEmail,
-        adminName: extractNameFromEmail(normalizedAdminEmail),
-        totalClaimed: 0,
-        claimedOpen: 0,
-        totalCompleted: 0,
-        completedThisMonth: 0
-      });
-    });
-
-    ordersSnapshot.forEach(doc => {
-      const order = doc.data() || {};
-      const claimedEmail = normalizeEmail(order.claimedByAdminEmail);
-      const claimedId = String(order.claimedByAdminId || '').trim();
-      const completedEmail = normalizeEmail(order.completedByAdminEmail);
-      const completedId = String(order.completedByAdminId || '').trim();
-      const isCompleted = Boolean(completedEmail || completedId);
-
-      if (claimedEmail || claimedId) {
-        const claimedEntry = ensureRankingEntry(rankingMap, {
-          adminId: claimedId,
-          adminEmail: claimedEmail,
-          adminName: order.claimedByAdminName
-        });
-        claimedEntry.totalClaimed += 1;
-        if (!isCompleted) {
-          claimedEntry.claimedOpen += 1;
-        }
-      }
-
-      if (completedEmail || completedId) {
-        const completedEntry = ensureRankingEntry(rankingMap, {
-          adminId: completedId,
-          adminEmail: completedEmail,
-          adminName: order.completedByAdminName
-        });
-        completedEntry.totalCompleted += 1;
-        if (order.completedAtISO && order.completedAtISO >= monthStartISO) {
-          completedEntry.completedThisMonth += 1;
-        }
-      }
-    });
-
-    const ranking = Array.from(rankingMap.values())
-      .sort((left, right) => (
-        right.totalCompleted - left.totalCompleted
-        || right.completedThisMonth - left.completedThisMonth
-        || right.claimedOpen - left.claimedOpen
-        || left.adminName.localeCompare(right.adminName, 'pt-BR')
-      ))
-      .map((entry, index) => ({
-        position: index + 1,
-        adminId: entry.adminId,
-        adminEmail: entry.adminEmail,
-        adminName: entry.adminName,
-        totalClaimed: entry.totalClaimed,
-        currentlyClaimed: entry.claimedOpen,
-        totalCompleted: entry.totalCompleted,
-        completedThisMonth: entry.completedThisMonth
-      }));
-
-    const ownStats = ranking.find(item => item.adminId === user.uid || item.adminEmail === email) || {
-      position: ranking.length + 1,
-      adminId: user.uid,
-      adminEmail: email,
-      adminName: user.displayName || extractNameFromEmail(email),
-      totalClaimed: 0,
-      currentlyClaimed: 0,
-      totalCompleted: 0,
-      completedThisMonth: 0
-    };
+    const adminSnapshot = await computeAdminStatsSnapshot(user.uid, email, user.displayName);
+    const ownStats = adminSnapshot.stats;
 
     res.json({
       success: true,
@@ -696,7 +625,7 @@ app.get('/api/admin/stats', requireAuth, async (req, res) => {
         adminId: user.uid,
         adminName: ownStats.adminName
       },
-      ranking
+      ranking: adminSnapshot.ranking
     });
   } catch (error) {
     console.error('[admin-stats] erro:', error);
@@ -704,6 +633,416 @@ app.get('/api/admin/stats', requireAuth, async (req, res) => {
     res.status(statusCode).json({
       success: false,
       error: error.publicMessage || 'Falha ao carregar estatisticas.'
+    });
+  }
+});
+
+app.get('/api/profile/me', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const email = normalizeEmail(user.email);
+    const role = isAdminEmail(email) ? 'admin' : 'client';
+    const authRecord = await getAuthRecordSafe(user.uid);
+    const profile = await syncUserProfileRecord(user, authRecord);
+
+    if (role === 'admin') {
+      const adminSnapshot = await computeAdminStatsSnapshot(user.uid, email, profile.name);
+      return res.json({
+        success: true,
+        profile,
+        stats: {
+          type: 'admin',
+          totalClaimed: adminSnapshot.stats.totalClaimed,
+          currentlyClaimed: adminSnapshot.stats.currentlyClaimed,
+          totalCompleted: adminSnapshot.stats.totalCompleted,
+          completedThisMonth: adminSnapshot.stats.completedThisMonth,
+          rankingPosition: adminSnapshot.stats.rankingPosition
+        },
+        ranking: adminSnapshot.ranking.slice(0, 10)
+      });
+    }
+
+    const clientStats = await computeClientStats(user.uid);
+    return res.json({
+      success: true,
+      profile,
+      stats: {
+        type: 'client',
+        totalOrdersCreated: clientStats.totalOrdersCreated,
+        totalPaidOrders: clientStats.totalPaidOrders,
+        totalCompletedOrders: clientStats.totalCompletedOrders
+      }
+    });
+  } catch (error) {
+    console.error('[profile-me] erro:', error);
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao carregar perfil.'
+    });
+  }
+});
+
+app.post('/api/profile/update', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const email = normalizeEmail(user.email);
+    const authRecord = await getAuthRecordSafe(user.uid);
+    const body = req.body || {};
+    const nextName = Object.prototype.hasOwnProperty.call(body, 'name') ? sanitizeString(body.name, 120) : null;
+    const nextPhotoURL = Object.prototype.hasOwnProperty.call(body, 'photoURL') ? sanitizeProfilePhotoURL(body.photoURL) : null;
+    const authUpdates = {};
+    const profileUpdates = {};
+
+    if (nextName !== null) {
+      if (!nextName || nextName.length < 2) {
+        return res.status(400).json({ success: false, error: 'Nome invalido. Use pelo menos 2 caracteres.' });
+      }
+      authUpdates.displayName = nextName;
+      profileUpdates.name = nextName;
+    }
+
+    if (nextPhotoURL !== null) {
+      authUpdates.photoURL = nextPhotoURL || null;
+      profileUpdates.photoURL = nextPhotoURL;
+    }
+
+    if (!Object.keys(authUpdates).length) {
+      return res.status(400).json({ success: false, error: 'Nenhum dado valido foi enviado para atualizar o perfil.' });
+    }
+
+    await admin.auth().updateUser(user.uid, authUpdates);
+    const profile = await syncUserProfileRecord(user, authRecord, {
+      ...profileUpdates,
+      email,
+      updatedAtISO: new Date().toISOString()
+    });
+
+    return res.json({
+      success: true,
+      profile
+    });
+  } catch (error) {
+    console.error('[profile-update] erro:', error);
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao atualizar perfil.'
+    });
+  }
+});
+
+app.post('/api/profile/password/send-code', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const email = normalizeEmail(user.email);
+    if (!email) {
+      return res.status(400).json({ success: false, error: 'Sua conta precisa ter email valido para redefinir a senha.' });
+    }
+
+    const flowRef = db.collection('passwordResetFlows').doc(user.uid);
+    const code = generatePasswordResetCode();
+    const now = new Date();
+    const nowISO = now.toISOString();
+    const expiresAtISO = new Date(now.getTime() + PASSWORD_RESET_CODE_TTL_MS).toISOString();
+    const resendAvailableAtISO = new Date(now.getTime() + PASSWORD_RESET_RESEND_COOLDOWN_MS).toISOString();
+    const codeHash = hashPasswordResetCode(user.uid, code);
+
+    const transactionResult = await db.runTransaction(async transaction => {
+      const flowDoc = await transaction.get(flowRef);
+      const flow = flowDoc.exists ? (flowDoc.data() || {}) : {};
+      const resendAvailableAt = parseISOToMillis(flow.resendAvailableAtISO);
+      const sendWindowStartedAt = parseISOToMillis(flow.sendWindowStartedAtISO);
+      const withinWindow = sendWindowStartedAt && (now.getTime() - sendWindowStartedAt) < (60 * 60 * 1000);
+      const sendCountInWindow = withinWindow ? Number(flow.sendCountInWindow || 0) : 0;
+
+      if (resendAvailableAt && resendAvailableAt > now.getTime()) {
+        return {
+          ok: false,
+          statusCode: 429,
+          publicMessage: 'Aguarde um pouco antes de pedir outro codigo.'
+        };
+      }
+
+      if (sendCountInWindow >= PASSWORD_RESET_MAX_SENDS_PER_HOUR) {
+        return {
+          ok: false,
+          statusCode: 429,
+          publicMessage: 'Voce atingiu o limite de codigos enviados nesta hora.'
+        };
+      }
+
+      transaction.set(flowRef, {
+        uid: user.uid,
+        email,
+        status: 'code_sent',
+        codeHash,
+        expiresAtISO,
+        resendAvailableAtISO,
+        sendWindowStartedAtISO: withinWindow ? flow.sendWindowStartedAtISO : nowISO,
+        sendCountInWindow: sendCountInWindow + 1,
+        failedAttempts: 0,
+        sessionTokenHash: '',
+        sessionExpiresAtISO: '',
+        verifiedAtISO: '',
+        updatedAtISO: nowISO,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      return { ok: true };
+    });
+
+    if (!transactionResult.ok) {
+      return res.status(transactionResult.statusCode).json({
+        success: false,
+        error: transactionResult.publicMessage
+      });
+    }
+
+    try {
+      await sendEmailViaEmailJS({
+        toEmail: email,
+        subjectLine: 'Codigo de seguranca da sua conta',
+        message: `Seu codigo para alterar a senha e: ${code}\n\nEsse codigo expira em 10 minutos.\nSe voce nao pediu essa alteracao, ignore este email.`
+      });
+    } catch (error) {
+      await flowRef.set({
+        status: 'send_failed',
+        resendAvailableAtISO: nowISO,
+        updatedAtISO: nowISO,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      return res.status(502).json({
+        success: false,
+        error: 'Nao foi possivel enviar o codigo por email agora. Tente novamente.'
+      });
+    }
+
+    return res.json({
+      success: true,
+      expiresAtISO,
+      resendAvailableAtISO
+    });
+  } catch (error) {
+    console.error('[profile-password-send-code] erro:', error);
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao enviar codigo de seguranca.'
+    });
+  }
+});
+
+app.post('/api/profile/password/verify-code', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const inputCode = String(req.body?.code || '').trim();
+
+    if (!/^\d{6}$/.test(inputCode)) {
+      return res.status(400).json({ success: false, error: 'Digite um codigo valido com 6 numeros.' });
+    }
+
+    const flowRef = db.collection('passwordResetFlows').doc(user.uid);
+    const now = new Date();
+    const nowISO = now.toISOString();
+    const sessionToken = generatePasswordResetSessionToken();
+    const sessionTokenHash = hashPasswordResetSessionToken(user.uid, sessionToken);
+    const sessionExpiresAtISO = new Date(now.getTime() + PASSWORD_RESET_SESSION_TTL_MS).toISOString();
+
+    const verification = await db.runTransaction(async transaction => {
+      const flowDoc = await transaction.get(flowRef);
+      if (!flowDoc.exists) {
+        return {
+          ok: false,
+          statusCode: 404,
+          publicMessage: 'Nenhum codigo foi enviado ainda para sua conta.'
+        };
+      }
+
+      const flow = flowDoc.data() || {};
+      const failedAttempts = Number(flow.failedAttempts || 0);
+      const expiresAt = parseISOToMillis(flow.expiresAtISO);
+
+      if (!flow.codeHash || flow.status === 'completed') {
+        return {
+          ok: false,
+          statusCode: 400,
+          publicMessage: 'Esse codigo nao esta mais disponivel. Peça um novo envio.'
+        };
+      }
+
+      if (expiresAt && expiresAt < now.getTime()) {
+        transaction.set(flowRef, {
+          status: 'expired',
+          updatedAtISO: nowISO,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        return {
+          ok: false,
+          statusCode: 400,
+          publicMessage: 'Esse codigo expirou. Peça um novo envio.'
+        };
+      }
+
+      if (failedAttempts >= PASSWORD_RESET_MAX_FAILED_ATTEMPTS) {
+        return {
+          ok: false,
+          statusCode: 429,
+          publicMessage: 'Muitas tentativas incorretas. Peça um novo codigo.'
+        };
+      }
+
+      const expectedHash = hashPasswordResetCode(user.uid, inputCode);
+      if (expectedHash !== flow.codeHash) {
+        const nextAttempts = failedAttempts + 1;
+        transaction.set(flowRef, {
+          failedAttempts: nextAttempts,
+          status: nextAttempts >= PASSWORD_RESET_MAX_FAILED_ATTEMPTS ? 'blocked' : 'code_sent',
+          updatedAtISO: nowISO,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        return {
+          ok: false,
+          statusCode: nextAttempts >= PASSWORD_RESET_MAX_FAILED_ATTEMPTS ? 429 : 400,
+          publicMessage: nextAttempts >= PASSWORD_RESET_MAX_FAILED_ATTEMPTS
+            ? 'Codigo bloqueado por excesso de tentativas. Peça um novo envio.'
+            : 'Codigo incorreto.'
+        };
+      }
+
+      transaction.set(flowRef, {
+        status: 'verified',
+        verifiedAtISO: nowISO,
+        sessionTokenHash,
+        sessionExpiresAtISO,
+        failedAttempts,
+        updatedAtISO: nowISO,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      return {
+        ok: true
+      };
+    });
+
+    if (!verification.ok) {
+      return res.status(verification.statusCode).json({
+        success: false,
+        error: verification.publicMessage
+      });
+    }
+
+    return res.json({
+      success: true,
+      sessionToken,
+      sessionExpiresAtISO
+    });
+  } catch (error) {
+    console.error('[profile-password-verify-code] erro:', error);
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao verificar codigo.'
+    });
+  }
+});
+
+app.post('/api/profile/password/update', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const sessionToken = String(req.body?.sessionToken || '').trim();
+    const newPassword = String(req.body?.newPassword || '');
+
+    if (!sessionToken) {
+      return res.status(400).json({ success: false, error: 'Sessao de verificacao invalida.' });
+    }
+
+    if (!isStrongPassword(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Use uma senha com pelo menos 8 caracteres, incluindo letra e numero.'
+      });
+    }
+
+    const flowRef = db.collection('passwordResetFlows').doc(user.uid);
+    const now = new Date();
+    const nowISO = now.toISOString();
+    const sessionTokenHash = hashPasswordResetSessionToken(user.uid, sessionToken);
+
+    const validation = await db.runTransaction(async transaction => {
+      const flowDoc = await transaction.get(flowRef);
+      if (!flowDoc.exists) {
+        return {
+          ok: false,
+          statusCode: 404,
+          publicMessage: 'Nao encontramos uma verificacao valida para esta conta.'
+        };
+      }
+
+      const flow = flowDoc.data() || {};
+      const sessionExpiresAt = parseISOToMillis(flow.sessionExpiresAtISO);
+
+      if (flow.status !== 'verified' || !flow.sessionTokenHash) {
+        return {
+          ok: false,
+          statusCode: 400,
+          publicMessage: 'Seu codigo ainda nao foi validado.'
+        };
+      }
+
+      if (flow.sessionTokenHash !== sessionTokenHash) {
+        return {
+          ok: false,
+          statusCode: 403,
+          publicMessage: 'Sessao de verificacao invalida.'
+        };
+      }
+
+      if (sessionExpiresAt && sessionExpiresAt < now.getTime()) {
+        transaction.set(flowRef, {
+          status: 'expired',
+          updatedAtISO: nowISO,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        return {
+          ok: false,
+          statusCode: 400,
+          publicMessage: 'Sua verificacao expirou. Envie um novo codigo.'
+        };
+      }
+
+      return { ok: true };
+    });
+
+    if (!validation.ok) {
+      return res.status(validation.statusCode).json({
+        success: false,
+        error: validation.publicMessage
+      });
+    }
+
+    await admin.auth().updateUser(user.uid, { password: newPassword });
+    await flowRef.set({
+      status: 'completed',
+      codeHash: '',
+      sessionTokenHash: '',
+      sessionExpiresAtISO: '',
+      completedAtISO: nowISO,
+      updatedAtISO: nowISO,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    return res.json({
+      success: true
+    });
+  } catch (error) {
+    console.error('[profile-password-update] erro:', error);
+    const statusCode = error.statusCode || 500;
+    return res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao atualizar senha.'
     });
   }
 });
@@ -833,6 +1172,262 @@ function ensureRankingEntry(rankingMap, identity) {
 
   rankingMap.set(mapKey, entry);
   return entry;
+}
+
+async function computeAdminStatsSnapshot(userId, email, displayName) {
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthStartISO = monthStart.toISOString();
+  const ordersSnapshot = await db.collection('orders').get();
+  const rankingMap = new Map();
+
+  ADMIN_EMAILS.forEach(adminEmail => {
+    const normalizedAdminEmail = normalizeEmail(adminEmail);
+    rankingMap.set(normalizedAdminEmail, {
+      adminId: '',
+      adminEmail: normalizedAdminEmail,
+      adminName: extractNameFromEmail(normalizedAdminEmail),
+      totalClaimed: 0,
+      claimedOpen: 0,
+      totalCompleted: 0,
+      completedThisMonth: 0
+    });
+  });
+
+  ordersSnapshot.forEach(doc => {
+    const order = doc.data() || {};
+    const claimedEmail = normalizeEmail(order.claimedByAdminEmail);
+    const claimedId = String(order.claimedByAdminId || '').trim();
+    const completedEmail = normalizeEmail(order.completedByAdminEmail);
+    const completedId = String(order.completedByAdminId || '').trim();
+    const isCompleted = Boolean(completedEmail || completedId);
+
+    if (claimedEmail || claimedId) {
+      const claimedEntry = ensureRankingEntry(rankingMap, {
+        adminId: claimedId,
+        adminEmail: claimedEmail,
+        adminName: order.claimedByAdminName
+      });
+      claimedEntry.totalClaimed += 1;
+      if (!isCompleted) {
+        claimedEntry.claimedOpen += 1;
+      }
+    }
+
+    if (completedEmail || completedId) {
+      const completedEntry = ensureRankingEntry(rankingMap, {
+        adminId: completedId,
+        adminEmail: completedEmail,
+        adminName: order.completedByAdminName
+      });
+      completedEntry.totalCompleted += 1;
+      if (order.completedAtISO && order.completedAtISO >= monthStartISO) {
+        completedEntry.completedThisMonth += 1;
+      }
+    }
+  });
+
+  const ranking = Array.from(rankingMap.values())
+    .sort((left, right) => (
+      right.totalCompleted - left.totalCompleted
+      || right.completedThisMonth - left.completedThisMonth
+      || right.claimedOpen - left.claimedOpen
+      || left.adminName.localeCompare(right.adminName, 'pt-BR')
+    ))
+    .map((entry, index) => ({
+      position: index + 1,
+      adminId: entry.adminId,
+      adminEmail: entry.adminEmail,
+      adminName: entry.adminName,
+      totalClaimed: entry.totalClaimed,
+      currentlyClaimed: entry.claimedOpen,
+      totalCompleted: entry.totalCompleted,
+      completedThisMonth: entry.completedThisMonth
+    }));
+
+  const ownStats = ranking.find(item => item.adminId === userId || item.adminEmail === email) || {
+    position: ranking.length + 1,
+    adminId: userId,
+    adminEmail: email,
+    adminName: displayName || extractNameFromEmail(email),
+    totalClaimed: 0,
+    currentlyClaimed: 0,
+    totalCompleted: 0,
+    completedThisMonth: 0
+  };
+
+  return {
+    stats: {
+      totalCompleted: ownStats.totalCompleted,
+      completedThisMonth: ownStats.completedThisMonth,
+      currentlyClaimed: ownStats.currentlyClaimed,
+      totalClaimed: ownStats.totalClaimed,
+      rankingPosition: ownStats.position,
+      adminName: ownStats.adminName
+    },
+    ranking
+  };
+}
+
+async function computeClientStats(userId) {
+  const ordersSnapshot = await db.collection('orders')
+    .where('userId', '==', userId)
+    .get();
+
+  let totalPaidOrders = 0;
+  let totalCompletedOrders = 0;
+
+  ordersSnapshot.forEach(doc => {
+    const order = doc.data() || {};
+    if (Boolean(order.payment?.paid)) {
+      totalPaidOrders += 1;
+    }
+    if (String(order.status || '').toLowerCase() === 'pedido finalizado') {
+      totalCompletedOrders += 1;
+    }
+  });
+
+  return {
+    totalOrdersCreated: ordersSnapshot.size,
+    totalPaidOrders,
+    totalCompletedOrders
+  };
+}
+
+async function getAuthRecordSafe(uid) {
+  try {
+    return await admin.auth().getUser(uid);
+  } catch (error) {
+    return null;
+  }
+}
+
+async function syncUserProfileRecord(user, authRecord, extraUpdates = {}) {
+  const email = normalizeEmail(extraUpdates.email || user.email || authRecord?.email);
+  const role = isAdminEmail(email) ? 'admin' : 'client';
+  const profileRef = db.collection('userProfiles').doc(user.uid);
+  const profileDoc = await profileRef.get();
+  const currentProfile = profileDoc.exists ? (profileDoc.data() || {}) : {};
+  const createdAtISO = currentProfile.createdAtISO
+    || toISOStringSafe(authRecord?.metadata?.creationTime)
+    || currentProfile.updatedAtISO
+    || new Date().toISOString();
+  const requestedUpdatedAtISO = extraUpdates.updatedAtISO || new Date().toISOString();
+  const profile = {
+    uid: user.uid,
+    name: sanitizeString(
+      extraUpdates.name
+      || currentProfile.name
+      || user.displayName
+      || authRecord?.displayName
+      || extractNameFromEmail(email),
+      120
+    ) || extractNameFromEmail(email || 'cliente@local'),
+    email,
+    role,
+    photoURL: sanitizeProfilePhotoURL(
+      Object.prototype.hasOwnProperty.call(extraUpdates, 'photoURL')
+        ? extraUpdates.photoURL
+        : (currentProfile.photoURL || user.photoURL || authRecord?.photoURL || '')
+    ) || '',
+    createdAtISO,
+    updatedAtISO: currentProfile.updatedAtISO || createdAtISO
+  };
+
+  const shouldWrite = !profileDoc.exists
+    || profile.name !== String(currentProfile.name || '')
+    || profile.email !== normalizeEmail(currentProfile.email)
+    || profile.role !== String(currentProfile.role || '')
+    || profile.photoURL !== String(currentProfile.photoURL || '')
+    || Boolean(extraUpdates.updatedAtISO)
+    || Object.prototype.hasOwnProperty.call(extraUpdates, 'name')
+    || Object.prototype.hasOwnProperty.call(extraUpdates, 'photoURL');
+
+  if (shouldWrite) {
+    profile.updatedAtISO = requestedUpdatedAtISO;
+    await profileRef.set({
+      ...profile,
+      createdAt: currentProfile.createdAt || admin.firestore.Timestamp.fromDate(new Date(createdAtISO)),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  }
+
+  return profile;
+}
+
+function sanitizeProfilePhotoURL(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) {
+    return '';
+  }
+  if (!/^https?:\/\//i.test(normalized)) {
+    const error = createHttpError(400, 'URL da foto de perfil invalida.');
+    throw error;
+  }
+  return normalized.slice(0, 2000);
+}
+
+function toISOStringSafe(value) {
+  if (!value) {
+    return '';
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString();
+}
+
+function parseISOToMillis(value) {
+  if (!value) {
+    return 0;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? 0 : parsed.getTime();
+}
+
+function generatePasswordResetCode() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+function generatePasswordResetSessionToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+function hashPasswordResetCode(uid, code) {
+  return crypto
+    .createHmac('sha256', ORDER_HMAC_SECRET)
+    .update(`password-reset-code:${uid}:${String(code || '').trim()}`)
+    .digest('hex');
+}
+
+function hashPasswordResetSessionToken(uid, token) {
+  return crypto
+    .createHmac('sha256', ORDER_HMAC_SECRET)
+    .update(`password-reset-session:${uid}:${String(token || '').trim()}`)
+    .digest('hex');
+}
+
+function isStrongPassword(password) {
+  const value = String(password || '');
+  return value.length >= 8 && /[A-Za-z]/.test(value) && /\d/.test(value);
+}
+
+async function sendEmailViaEmailJS({ toEmail, subjectLine, message }) {
+  await axios.post('https://api.emailjs.com/api/v1.0/email/send', {
+    service_id: EMAILJS_SERVICE_ID,
+    template_id: EMAILJS_TEMPLATE_ID,
+    user_id: EMAILJS_PUBLIC_KEY,
+    template_params: {
+      user_email: toEmail,
+      reply_to: toEmail,
+      order_id: 'Conta',
+      plan: subjectLine,
+      message
+    }
+  }, {
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    timeout: 10000
+  });
 }
 
 app.listen(PORT, () => {
