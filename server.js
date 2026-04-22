@@ -803,10 +803,14 @@ app.post('/api/profile/password/send-code', requireAuth, async (req, res) => {
     try {
       await sendEmailViaEmailJS({
         toEmail: email,
-        subjectLine: 'Seguranca da conta',
-        message: code,
-        orderId: 'ALTERACAO-DE-SENHA',
-        replyTo: email
+        templateParams: {
+          user_email: email,
+          reply_to: email,
+          code,
+          verification_code: code,
+          message: code,
+          expires_minutes: 10
+        }
       });
     } catch (error) {
       await flowRef.set({
@@ -1421,19 +1425,19 @@ function isStrongPassword(password) {
   return value.length >= 8 && /[A-Za-z]/.test(value) && /\d/.test(value);
 }
 
-async function sendEmailViaEmailJS({ toEmail, subjectLine, message, orderId = 'Conta', replyTo = '' }) {
+async function sendEmailViaEmailJS({ toEmail, templateParams = {} }) {
   try {
+    const params = {
+      user_email: toEmail,
+      reply_to: toEmail,
+      ...templateParams
+    };
+
     const payload = {
       service_id: EMAILJS_SERVICE_ID,
       template_id: EMAILJS_TEMPLATE_ID,
       user_id: EMAILJS_PUBLIC_KEY,
-      template_params: {
-        user_email: toEmail,
-        reply_to: replyTo || toEmail,
-        order_id: orderId,
-        plan: subjectLine,
-        message
-      }
+      template_params: params
     };
 
     if (EMAILJS_PRIVATE_KEY) {
