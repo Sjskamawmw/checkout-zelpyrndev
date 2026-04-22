@@ -813,9 +813,17 @@ app.post('/api/profile/password/send-code', requireAuth, async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
 
+      console.error('[profile-password-send-code] falha ao enviar email:', {
+        statusCode: error.statusCode || error.responseStatus || 502,
+        publicMessage: error.publicMessage || error.message,
+        provider: error.provider || 'emailjs',
+        providerCode: error.providerCode || '',
+        providerDetail: error.providerDetail || ''
+      });
+
       return res.status(502).json({
         success: false,
-        error: 'Nao foi possivel enviar o codigo por email agora. Tente novamente.'
+        error: error.publicMessage || 'Nao foi possivel enviar o codigo por email agora. Tente novamente.'
       });
     }
 
@@ -1411,23 +1419,50 @@ function isStrongPassword(password) {
 }
 
 async function sendEmailViaEmailJS({ toEmail, subjectLine, message }) {
-  await axios.post('https://api.emailjs.com/api/v1.0/email/send', {
-    service_id: EMAILJS_SERVICE_ID,
-    template_id: EMAILJS_TEMPLATE_ID,
-    user_id: EMAILJS_PUBLIC_KEY,
-    template_params: {
-      user_email: toEmail,
-      reply_to: toEmail,
-      order_id: 'Conta',
-      plan: subjectLine,
-      message
-    }
-  }, {
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    timeout: 10000
-  });
+  try {
+    await axios.post('https://api.emailjs.com/api/v1.0/email/send', {
+      service_id: EMAILJS_SERVICE_ID,
+      template_id: EMAILJS_TEMPLATE_ID,
+      user_id: EMAILJS_PUBLIC_KEY,
+      template_params: {
+        user_email: toEmail,
+        reply_to: toEmail,
+        order_id: 'Conta',
+        plan: subjectLine,
+        message
+      }
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+  } catch (error) {
+    const responseStatus = error.response?.status || 502;
+    const responseData = error.response?.data;
+    const responseText = typeof responseData === 'string'
+      ? responseData
+      : JSON.stringify(responseData || {});
+    const providerDetail = String(responseText || error.message || '').slice(0, 300);
+
+    console.error('[emailjs] erro ao enviar email:', {
+      status: responseStatus,
+      serviceId: EMAILJS_SERVICE_ID,
+      templateId: EMAILJS_TEMPLATE_ID,
+      publicKeySuffix: EMAILJS_PUBLIC_KEY ? EMAILJS_PUBLIC_KEY.slice(-6) : '',
+      toEmail,
+      detail: providerDetail
+    });
+
+    const wrapped = new Error(`EmailJS respondeu ${responseStatus}. ${providerDetail || 'Sem detalhe adicional.'}`);
+    wrapped.statusCode = 502;
+    wrapped.responseStatus = responseStatus;
+    wrapped.provider = 'emailjs';
+    wrapped.providerCode = `EMAILJS_${responseStatus}`;
+    wrapped.providerDetail = providerDetail;
+    wrapped.publicMessage = `Nao foi possivel enviar o codigo por email agora. EmailJS respondeu ${responseStatus}.`;
+    throw wrapped;
+  }
 }
 
 app.listen(PORT, () => {
