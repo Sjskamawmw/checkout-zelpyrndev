@@ -284,6 +284,557 @@ app.post('/api/webhooks/infinitepay', async (req, res) => {
   }
 });
 
+// Admin Claims System
+app.post('/api/orders/claim', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { orderId } = req.body || {};
+    const normalizedOrderId = normalizeOrderId(orderId);
+
+    if (!normalizedOrderId) {
+      return res.status(400).json({ success: false, error: 'orderId obrigatorio.' });
+    }
+
+    const email = normalizeEmail(user.email);
+    if (!isAdminEmail(email)) {
+      return res.status(403).json({ success: false, error: 'Apenas administradores podem reivindicar pedidos.' });
+    }
+
+    const orderRef = db.collection('orders').doc(normalizedOrderId);
+    const nowISO = new Date().toISOString();
+    const adminName = user.displayName || extractNameFromEmail(email);
+    const claimedBy = await db.runTransaction(async transaction => {
+      const orderDoc = await transaction.get(orderRef);
+
+      if (!orderDoc.exists) {
+        throw createHttpError(404, 'Pedido nao encontrado.');
+      }
+
+      const order = orderDoc.data() || {};
+      const currentClaim = buildClaimedBySummary(order);
+      const alreadyClaimedByCurrentAdmin = currentClaim.adminId === user.uid || currentClaim.email === email;
+
+      if (order.completedByAdminId || order.completedByAdminEmail) {
+        throw createHttpError(409, 'Este pedido ja foi concluido e nao pode ser reivindicado novamente.', {
+          completedBy: buildCompletedBySummary(order)
+        });
+      }
+
+      if ((currentClaim.adminId || currentClaim.email) && !alreadyClaimedByCurrentAdmin) {
+        throw createHttpError(409, 'Este pedido ja foi reivindicado por outro admin.', {
+          claimedBy: currentClaim
+        });
+      }
+
+      if (!alreadyClaimedByCurrentAdmin) {
+        transaction.set(orderRef, {
+          claimedByAdminId: user.uid,
+          claimedByAdminEmail: email,
+          claimedByAdminName: adminName,
+          claimedAt: admin.firestore.FieldValue.serverTimestamp(),
+          claimedAtISO: nowISO,
+          updatedAtISO: nowISO,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+
+      return {
+        adminId: user.uid,
+        name: adminName,
+        email
+      };
+    });
+
+    res.json({
+      success: true,
+      orderId: normalizedOrderId,
+      claimedBy
+    });
+  } catch (error) {
+    console.error('[claim-order] erro:', error);
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao reivindicar pedido.',
+      claimedBy: error.claimedBy || null,
+      completedBy: error.completedBy || null
+    });
+  }
+});
+
+app.post('/api/orders/release-admin', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { orderId, releaseeEmail } = req.body || {};
+    const normalizedOrderId = normalizeOrderId(orderId);
+    const email = normalizeEmail(user.email);
+
+    if (!normalizedOrderId) {
+      return res.status(400).json({ success: false, error: 'orderId obrigatorio.' });
+    }
+
+    if (!releaseeEmail || !String(releaseeEmail).includes('@')) {
+      return res.status(400).json({ success: false, error: 'Email do admin invalido.' });
+    }
+
+    const releaseeEmailNormalized = String(releaseeEmail).trim().toLowerCase();
+
+    if (!isAdminEmail(email)) {
+      return res.status(403).json({ success: false, error: 'Apenas administradores podem liberar acesso.' });
+    }
+
+    if (!isAdminEmail(releaseeEmailNormalized)) {
+      return res.status(400).json({ success: false, error: 'Email do admin nao esta registrado.' });
+    }
+
+    const releaseeIdentity = await resolveAdminIdentityByEmail(releaseeEmailNormalized);
+    const orderRef = db.collection('orders').doc(normalizedOrderId);
+    const nowISO = new Date().toISOString();
+    const released = await db.runTransaction(async transaction => {
+      const orderDoc = await transaction.get(orderRef);
+
+      if (!orderDoc.exists) {
+        throw createHttpError(404, 'Pedido nao encontrado.');
+      }
+
+      const order = orderDoc.data() || {};
+      ensurePrincipalAdminOrThrow(order, user.uid, email, 'Apenas o admin principal pode liberar outros admins.');
+
+      if (!order.claimedByAdminId && !order.claimedByAdminEmail) {
+        throw createHttpError(409, 'O pedido precisa ser reivindicado antes de liberar outro admin.');
+      }
+
+      if (order.completedByAdminId || order.completedByAdminEmail) {
+        throw createHttpError(409, 'Pedido ja concluido. Nao e possivel liberar novos admins.');
+      }
+
+      if (releaseeEmailNormalized === email) {
+        throw createHttpError(400, 'Voce ja eh o admin principal, nao pode se liberar.');
+      }
+
+      const releasedAdmins = normalizeReleasedAdminsForServer(order.releasedAdmins);
+      const alreadyReleased = releasedAdmins.some(item => item.email === releaseeEmailNormalized);
+
+      if (alreadyReleased) {
+        throw createHttpError(409, 'Este admin ja foi liberado para este pedido.');
+      }
+
+      releasedAdmins.push({
+        uid: releaseeIdentity.uid,
+        name: releaseeIdentity.name,
+        email: releaseeIdentity.email,
+        releasedAt: admin.firestore.Timestamp.now(),
+        releasedAtISO: nowISO,
+        releasedByAdminId: user.uid
+      });
+
+      transaction.set(orderRef, {
+        releasedAdmins,
+        updatedAtISO: nowISO,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+
+      return {
+        uid: releaseeIdentity.uid,
+        name: releaseeIdentity.name,
+        email: releaseeIdentity.email
+      };
+    });
+
+    res.json({
+      success: true,
+      orderId: normalizedOrderId,
+      released
+    });
+  } catch (error) {
+    console.error('[release-admin] erro:', error);
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao liberar admin.'
+    });
+  }
+});
+
+app.post('/api/orders/remove-released-admin', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { orderId, adminEmail } = req.body || {};
+    const normalizedOrderId = normalizeOrderId(orderId);
+    const email = normalizeEmail(user.email);
+
+    if (!normalizedOrderId) {
+      return res.status(400).json({ success: false, error: 'orderId obrigatorio.' });
+    }
+
+    if (!adminEmail || !String(adminEmail).includes('@')) {
+      return res.status(400).json({ success: false, error: 'Email do admin invalido.' });
+    }
+
+    const adminEmailNormalized = String(adminEmail).trim().toLowerCase();
+
+    if (!isAdminEmail(email)) {
+      return res.status(403).json({ success: false, error: 'Apenas administradores podem remover acesso.' });
+    }
+
+    const orderRef = db.collection('orders').doc(normalizedOrderId);
+    const nowISO = new Date().toISOString();
+    await db.runTransaction(async transaction => {
+      const orderDoc = await transaction.get(orderRef);
+
+      if (!orderDoc.exists) {
+        throw createHttpError(404, 'Pedido nao encontrado.');
+      }
+
+      const order = orderDoc.data() || {};
+      ensurePrincipalAdminOrThrow(order, user.uid, email, 'Apenas o admin principal pode remover acesso de outros admins.');
+
+      const releasedAdmins = normalizeReleasedAdminsForServer(order.releasedAdmins);
+      const filtered = releasedAdmins.filter(item => item.email !== adminEmailNormalized);
+
+      if (filtered.length === releasedAdmins.length) {
+        throw createHttpError(404, 'Admin nao encontrado na lista de liberados.');
+      }
+
+      transaction.set(orderRef, {
+        releasedAdmins: filtered,
+        updatedAtISO: nowISO,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+    });
+
+    res.json({
+      success: true,
+      orderId: normalizedOrderId,
+      removed: {
+        email: adminEmailNormalized
+      }
+    });
+  } catch (error) {
+    console.error('[remove-released-admin] erro:', error);
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao remover admin.'
+    });
+  }
+});
+
+app.post('/api/orders/complete', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { orderId } = req.body || {};
+    const normalizedOrderId = normalizeOrderId(orderId);
+
+    if (!normalizedOrderId) {
+      return res.status(400).json({ success: false, error: 'orderId obrigatorio.' });
+    }
+
+    const email = normalizeEmail(user.email);
+    if (!isAdminEmail(email)) {
+      return res.status(403).json({ success: false, error: 'Apenas administradores podem concluir pedidos.' });
+    }
+
+    const orderRef = db.collection('orders').doc(normalizedOrderId);
+    const nowISO = new Date().toISOString();
+    const adminName = user.displayName || extractNameFromEmail(email);
+    const completedBy = await db.runTransaction(async transaction => {
+      const orderDoc = await transaction.get(orderRef);
+
+      if (!orderDoc.exists) {
+        throw createHttpError(404, 'Pedido nao encontrado.');
+      }
+
+      const order = orderDoc.data() || {};
+      ensurePrincipalAdminOrThrow(order, user.uid, email, 'Apenas o admin principal pode concluir o pedido.');
+
+      const currentCompletion = buildCompletedBySummary(order);
+      const alreadyCompletedByCurrentAdmin = currentCompletion.adminId === user.uid || currentCompletion.email === email;
+
+      if ((currentCompletion.adminId || currentCompletion.email) && !alreadyCompletedByCurrentAdmin) {
+        throw createHttpError(409, 'Este pedido ja foi concluido por outro admin.', {
+          completedBy: currentCompletion
+        });
+      }
+
+      if (!alreadyCompletedByCurrentAdmin) {
+        transaction.set(orderRef, {
+          completedByAdminId: user.uid,
+          completedByAdminEmail: email,
+          completedByAdminName: adminName,
+          completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          completedAtISO: nowISO,
+          status: 'Pedido finalizado',
+          updatedAtISO: nowISO,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+
+      return {
+        adminId: user.uid,
+        name: adminName,
+        email
+      };
+    });
+
+    res.json({
+      success: true,
+      orderId: normalizedOrderId,
+      completedBy,
+      newStatus: 'Pedido finalizado'
+    });
+  } catch (error) {
+    console.error('[complete-order] erro:', error);
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao concluir pedido.',
+      completedBy: error.completedBy || null
+    });
+  }
+});
+
+app.get('/api/admin/stats', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const email = normalizeEmail(user.email);
+
+    if (!isAdminEmail(email)) {
+      return res.status(403).json({ success: false, error: 'Apenas administradores podem acessar estatisticas.' });
+    }
+
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthStartISO = monthStart.toISOString();
+    const ordersSnapshot = await db.collection('orders').get();
+    const rankingMap = new Map();
+
+    ADMIN_EMAILS.forEach(adminEmail => {
+      const normalizedAdminEmail = normalizeEmail(adminEmail);
+      rankingMap.set(normalizedAdminEmail, {
+        adminId: '',
+        adminEmail: normalizedAdminEmail,
+        adminName: extractNameFromEmail(normalizedAdminEmail),
+        totalClaimed: 0,
+        claimedOpen: 0,
+        totalCompleted: 0,
+        completedThisMonth: 0
+      });
+    });
+
+    ordersSnapshot.forEach(doc => {
+      const order = doc.data() || {};
+      const claimedEmail = normalizeEmail(order.claimedByAdminEmail);
+      const claimedId = String(order.claimedByAdminId || '').trim();
+      const completedEmail = normalizeEmail(order.completedByAdminEmail);
+      const completedId = String(order.completedByAdminId || '').trim();
+      const isCompleted = Boolean(completedEmail || completedId);
+
+      if (claimedEmail || claimedId) {
+        const claimedEntry = ensureRankingEntry(rankingMap, {
+          adminId: claimedId,
+          adminEmail: claimedEmail,
+          adminName: order.claimedByAdminName
+        });
+        claimedEntry.totalClaimed += 1;
+        if (!isCompleted) {
+          claimedEntry.claimedOpen += 1;
+        }
+      }
+
+      if (completedEmail || completedId) {
+        const completedEntry = ensureRankingEntry(rankingMap, {
+          adminId: completedId,
+          adminEmail: completedEmail,
+          adminName: order.completedByAdminName
+        });
+        completedEntry.totalCompleted += 1;
+        if (order.completedAtISO && order.completedAtISO >= monthStartISO) {
+          completedEntry.completedThisMonth += 1;
+        }
+      }
+    });
+
+    const ranking = Array.from(rankingMap.values())
+      .sort((left, right) => (
+        right.totalCompleted - left.totalCompleted
+        || right.completedThisMonth - left.completedThisMonth
+        || right.claimedOpen - left.claimedOpen
+        || left.adminName.localeCompare(right.adminName, 'pt-BR')
+      ))
+      .map((entry, index) => ({
+        position: index + 1,
+        adminId: entry.adminId,
+        adminEmail: entry.adminEmail,
+        adminName: entry.adminName,
+        totalClaimed: entry.totalClaimed,
+        currentlyClaimed: entry.claimedOpen,
+        totalCompleted: entry.totalCompleted,
+        completedThisMonth: entry.completedThisMonth
+      }));
+
+    const ownStats = ranking.find(item => item.adminId === user.uid || item.adminEmail === email) || {
+      position: ranking.length + 1,
+      adminId: user.uid,
+      adminEmail: email,
+      adminName: user.displayName || extractNameFromEmail(email),
+      totalClaimed: 0,
+      currentlyClaimed: 0,
+      totalCompleted: 0,
+      completedThisMonth: 0
+    };
+
+    res.json({
+      success: true,
+      stats: {
+        totalCompleted: ownStats.totalCompleted,
+        completedThisMonth: ownStats.completedThisMonth,
+        currentlyClaimed: ownStats.currentlyClaimed,
+        totalClaimed: ownStats.totalClaimed,
+        rankingPosition: ownStats.position,
+        adminEmail: email,
+        adminId: user.uid,
+        adminName: ownStats.adminName
+      },
+      ranking
+    });
+  } catch (error) {
+    console.error('[admin-stats] erro:', error);
+    const statusCode = error.statusCode || 500;
+    res.status(statusCode).json({
+      success: false,
+      error: error.publicMessage || 'Falha ao carregar estatisticas.'
+    });
+  }
+});
+
+function extractNameFromEmail(email) {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized) {
+    return 'Admin';
+  }
+  const localPart = normalized.split('@')[0] || 'admin';
+  return localPart.replace(/[._-]+/g, ' ').replace(/\b\w/g, char => char.toUpperCase());
+}
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isAdminEmail(email) {
+  return ADMIN_EMAILS.includes(normalizeEmail(email));
+}
+
+function createHttpError(statusCode, publicMessage, extra = {}) {
+  const error = new Error(publicMessage);
+  error.statusCode = statusCode;
+  error.publicMessage = publicMessage;
+  Object.assign(error, extra);
+  return error;
+}
+
+function buildClaimedBySummary(order) {
+  return {
+    adminId: String(order?.claimedByAdminId || ''),
+    name: String(order?.claimedByAdminName || extractNameFromEmail(order?.claimedByAdminEmail || 'admin@local')),
+    email: normalizeEmail(order?.claimedByAdminEmail)
+  };
+}
+
+function buildCompletedBySummary(order) {
+  return {
+    adminId: String(order?.completedByAdminId || ''),
+    name: String(order?.completedByAdminName || extractNameFromEmail(order?.completedByAdminEmail || 'admin@local')),
+    email: normalizeEmail(order?.completedByAdminEmail)
+  };
+}
+
+function ensurePrincipalAdminOrThrow(order, userId, email, publicMessage) {
+  const claimedByUserId = String(order?.claimedByAdminId || '');
+  const claimedByEmail = normalizeEmail(order?.claimedByAdminEmail);
+  const currentEmail = normalizeEmail(email);
+
+  if (!claimedByUserId && !claimedByEmail) {
+    throw createHttpError(409, 'Este pedido ainda nao possui admin principal.');
+  }
+
+  if (claimedByUserId === userId || claimedByEmail === currentEmail) {
+    return;
+  }
+
+  throw createHttpError(403, publicMessage);
+}
+
+function normalizeReleasedAdminsForServer(list) {
+  if (!Array.isArray(list)) {
+    return [];
+  }
+
+  return list
+    .map(item => ({
+      uid: String(item?.uid || ''),
+      name: String(item?.name || extractNameFromEmail(item?.email || 'admin@local')),
+      email: normalizeEmail(item?.email),
+      releasedAt: item?.releasedAt || null,
+      releasedAtISO: String(item?.releasedAtISO || ''),
+      releasedByAdminId: String(item?.releasedByAdminId || '')
+    }))
+    .filter(item => Boolean(item.email));
+}
+
+async function resolveAdminIdentityByEmail(email) {
+  const normalized = normalizeEmail(email);
+  const fallback = {
+    uid: '',
+    email: normalized,
+    name: extractNameFromEmail(normalized)
+  };
+
+  try {
+    const authUser = await admin.auth().getUserByEmail(normalized);
+    return {
+      uid: authUser.uid || '',
+      email: normalizeEmail(authUser.email) || normalized,
+      name: authUser.displayName || extractNameFromEmail(authUser.email || normalized)
+    };
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function ensureRankingEntry(rankingMap, identity) {
+  const adminEmail = normalizeEmail(identity?.adminEmail);
+  const adminId = String(identity?.adminId || '').trim();
+  const mapKey = adminEmail || adminId || `admin-${rankingMap.size + 1}`;
+  const existing = rankingMap.get(mapKey);
+
+  if (existing) {
+    if (!existing.adminId && adminId) {
+      existing.adminId = adminId;
+    }
+    if (!existing.adminEmail && adminEmail) {
+      existing.adminEmail = adminEmail;
+    }
+    if ((!existing.adminName || existing.adminName === 'Admin') && identity?.adminName) {
+      existing.adminName = String(identity.adminName);
+    }
+    return existing;
+  }
+
+  const entry = {
+    adminId,
+    adminEmail,
+    adminName: String(identity?.adminName || extractNameFromEmail(adminEmail || 'admin@local')),
+    totalClaimed: 0,
+    claimedOpen: 0,
+    totalCompleted: 0,
+    completedThisMonth: 0
+  };
+
+  rankingMap.set(mapKey, entry);
+  return entry;
+}
+
 app.listen(PORT, () => {
   console.log(`API rodando em http://localhost:${PORT}`);
 });
@@ -391,6 +942,17 @@ function buildOrderPayload(body, user) {
     amountCents,
     status: 'Pedido recebido',
     adminMessage: '',
+    claimedByAdminId: '',
+    claimedByAdminName: '',
+    claimedByAdminEmail: '',
+    claimedAt: null,
+    claimedAtISO: '',
+    releasedAdmins: [],
+    completedByAdminId: '',
+    completedByAdminName: '',
+    completedByAdminEmail: '',
+    completedAt: null,
+    completedAtISO: '',
     createdAtISO,
     createdAt: admin.firestore.FieldValue.serverTimestamp()
   };
@@ -543,8 +1105,8 @@ function ensureOrderAccess(user, order) {
     throw error;
   }
 
-  const email = String(user.email || '').toLowerCase();
-  const isAdmin = ADMIN_EMAILS.includes(email);
+  const email = normalizeEmail(user.email);
+  const isAdmin = isAdminEmail(email);
 
   if (isAdmin) {
     return;
