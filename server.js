@@ -18,6 +18,7 @@ const ORDER_HMAC_SECRET = (process.env.ORDER_HMAC_SECRET || '').trim();
 const EMAILJS_SERVICE_ID = (process.env.EMAILJS_SERVICE_ID || 'service_37zjx24').trim();
 const EMAILJS_TEMPLATE_ID = (process.env.EMAILJS_TEMPLATE_ID || 'template_vxh3c9g').trim();
 const EMAILJS_PUBLIC_KEY = (process.env.EMAILJS_PUBLIC_KEY || 'x5hcmELDSLfjTS8I0').trim();
+const EMAILJS_PRIVATE_KEY = (process.env.EMAILJS_PRIVATE_KEY || '').trim();
 const PASSWORD_RESET_CODE_TTL_MS = 10 * 60 * 1000;
 const PASSWORD_RESET_RESEND_COOLDOWN_MS = 60 * 1000;
 const PASSWORD_RESET_SESSION_TTL_MS = 15 * 60 * 1000;
@@ -1420,7 +1421,7 @@ function isStrongPassword(password) {
 
 async function sendEmailViaEmailJS({ toEmail, subjectLine, message }) {
   try {
-    await axios.post('https://api.emailjs.com/api/v1.0/email/send', {
+    const payload = {
       service_id: EMAILJS_SERVICE_ID,
       template_id: EMAILJS_TEMPLATE_ID,
       user_id: EMAILJS_PUBLIC_KEY,
@@ -1431,7 +1432,13 @@ async function sendEmailViaEmailJS({ toEmail, subjectLine, message }) {
         plan: subjectLine,
         message
       }
-    }, {
+    };
+
+    if (EMAILJS_PRIVATE_KEY) {
+      payload.accessToken = EMAILJS_PRIVATE_KEY;
+    }
+
+    await axios.post('https://api.emailjs.com/api/v1.0/email/send', payload, {
       headers: {
         'Content-Type': 'application/json'
       },
@@ -1450,6 +1457,7 @@ async function sendEmailViaEmailJS({ toEmail, subjectLine, message }) {
       serviceId: EMAILJS_SERVICE_ID,
       templateId: EMAILJS_TEMPLATE_ID,
       publicKeySuffix: EMAILJS_PUBLIC_KEY ? EMAILJS_PUBLIC_KEY.slice(-6) : '',
+      privateKeyConfigured: Boolean(EMAILJS_PRIVATE_KEY),
       toEmail,
       detail: providerDetail
     });
